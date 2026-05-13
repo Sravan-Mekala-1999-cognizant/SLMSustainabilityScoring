@@ -12,8 +12,8 @@ from openai import OpenAI
 HOST    = "http://10.120.100.16"                 # base host (no trailing slash)
 API_KEY = "sk-your-key-here"                     # replace with your Open WebUI key
 
-# Open WebUI OpenAI-compatible endpoint
-BASE_URL = f"{HOST}/openai/v1"
+# LiteLLM proxy endpoint (confirmed from browser network calls)
+BASE_URL = f"{HOST}/litellm/v1"
 
 # Models to test — script will auto-detect available ones, but list fallback here
 MODELS = [
@@ -90,8 +90,8 @@ client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 def list_available_models() -> list[str]:
     """Fetch model list via raw requests to avoid openai SDK parsing issues."""
     headers = {"Authorization": f"Bearer {API_KEY}"}
-    # Try OpenAI-compatible endpoint first, then Open WebUI native endpoint
-    for url in [f"{BASE_URL}/models", f"{HOST}/api/models"]:
+    # LiteLLM proxy models endpoint (confirmed from browser network calls)
+    for url in [f"{BASE_URL}/models", f"{HOST}/openai/v1/models"]:
         try:
             r = requests.get(url, headers=headers, timeout=10)
             r.raise_for_status()
