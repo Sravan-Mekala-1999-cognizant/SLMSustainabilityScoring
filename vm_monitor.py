@@ -1,12 +1,11 @@
 """
-VM resource monitor — run this BEFORE starting sentiment_analysis.py.
-Logs CPU, RAM, GPU, and disk I/O every INTERVAL seconds to vm_metrics.csv.
-Stop with Ctrl+C; a summary table is printed on exit.
+VM resource monitor — zero external dependencies, Linux only.
+Reads CPU/RAM from /proc, GPU from nvidia-smi, disk from /proc/diskstats.
 
 Usage:
-    python vm_monitor.py               # default 2-second interval
-    python vm_monitor.py --interval 1  # 1-second interval
-    python vm_monitor.py --output my_run.csv
+    python3 vm_monitor.py                   # 2s interval, writes vm_metrics.csv
+    python3 vm_monitor.py --interval 1      # 1s interval
+    python3 vm_monitor.py --output run1.csv
 """
 
 import argparse
@@ -18,26 +17,124 @@ import sys
 import time
 from datetime import datetime
 
-try:
-    import psutil
-except ImportError:
-    sys.exit("psutil not found. Run: pip install psutil")
+# ── CPU (/proc/stat) ──────────────────────────────────────────────────────────
+def read_cpu_stat() -> list[list[int]]:
+    """Return raw cpu field lists from /proc/stat (overall + per-core)."""
+    lines = []
+    with open("/proc/stat") as f:
+        for line in f:
+            if line.startswith("cpu"):
+                parts = line.split()
+                lines.append([int(x) for x in parts[1:8]])  # user nice sys idle iowait irq softirq
+    return lines  # index 0 = aggregate, 1.. = per core
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-DEFAULT_INTERVAL  = 2      # seconds between samples
-DEFAULT_OUTPUT    = "vm_metrics.csv"
-GPU_QUERY_FIELDS  = [
-    "index",
-    "utilization.gpu",
-    "utilization.memory",
-    "memory.used",
-    "memory.total",
-    "temperature.gpu",
-    "power.draw",
+
+_prev_cpu = None
+
+def cpu_percent() -> tuple[float, list[float]]:
+    """Return (overall_pct, [per_core_pct]) since last call."""
+    global _prev_cpu
+    curr = read_cpu_stat()
+
+    if _prev_cpu is None:
+        _prev_cpu = curr
+        return 0.0, [0.0] * (len(curr) - 1)
+
+    def pct(prev, cur):
+        prev_idle = prev[3] + prev[4]          # idle + iowait
+        curr_idle = cur[3]  + cur[4]
+        prev_total = sum(prev)
+        curr_total = sum(cur)
+        d_total = curr_total - prev_total
+        d_idle  = curr_idle  - prev_idle
+        if d_total == 0:
+            return 0.0
+        return round((1 - d_idle / d_total) * 100, 1)
+
+    overall   = pct(_prev_cpu[0], curr[0])
+    per_core  = [pct(_prev_cpu[i], curr[i]) for i in range(1, len(curr))]
+    _prev_cpu = curr
+    return overall, per_core
+
+
+# ── RAM (/proc/meminfo) ───────────────────────────────────────────────────────
+def read_meminfo() -> dict[str, int]:
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 2:
+                info[parts[0].rstrip(":")] = int(parts[1])  # value in kB
+    return info
+
+
+def ram_stats() -> tuple[float, float, float]:
+    """Return (used_gb, total_gb, pct)."""
+    m          = read_meminfo()
+    total_kb   = m.get("MemTotal", 0)
+    avail_kb   = m.get("MemAvailable", m.get("MemFree", 0))
+    used_kb    = total_kb - avail_kb
+    total_gb   = round(total_kb  / 1024**2, 2)
+    used_gb    = round(used_kb   / 1024**2, 2)
+    pct        = round(used_kb / total_kb * 100, 1) if total_kb else 0.0
+    return used_gb, total_gb, pct
+
+
+# ── DISK (/proc/diskstats) ────────────────────────────────────────────────────
+_prev_disk = None
+_prev_disk_time = None
+
+def disk_io_rates() -> tuple[float, float]:
+    """Return (read_mbps, write_mbps) since last call."""
+    global _prev_disk, _prev_disk_time
+
+    stats = {}
+    with open("/proc/diskstats") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 14:
+                dev = parts[2]
+                # Only physical disks (sda, vda, nvme0n1, etc.), skip partitions
+                if dev[-1].isdigit() and not dev.startswith("nvme"):
+                    continue
+                if dev.startswith("loop") or dev.startswith("dm-"):
+                    continue
+                read_sectors  = int(parts[5])
+                write_sectors = int(parts[9])
+                stats[dev] = (read_sectors, write_sectors)
+
+    now = time.time()
+
+    if _prev_disk is None or not stats:
+        _prev_disk      = stats
+        _prev_disk_time = now
+        return 0.0, 0.0
+
+    dt = now - _prev_disk_time
+    if dt <= 0:
+        return 0.0, 0.0
+
+    total_read  = sum(stats[d][0] for d in stats)
+    total_write = sum(stats[d][1] for d in stats)
+    prev_read   = sum(_prev_disk.get(d, (0, 0))[0] for d in stats)
+    prev_write  = sum(_prev_disk.get(d, (0, 0))[1] for d in stats)
+
+    sector_bytes = 512
+    read_mbps  = round((total_read  - prev_read)  * sector_bytes / dt / 1024**2, 2)
+    write_mbps = round((total_write - prev_write) * sector_bytes / dt / 1024**2, 2)
+
+    _prev_disk      = stats
+    _prev_disk_time = now
+    return read_mbps, write_mbps
+
+
+# ── GPU (nvidia-smi) ──────────────────────────────────────────────────────────
+GPU_FIELDS = [
+    "index", "utilization.gpu", "utilization.memory",
+    "memory.used", "memory.total", "temperature.gpu", "power.draw",
 ]
 
-# ── GPU ───────────────────────────────────────────────────────────────────────
-def nvidia_smi_available() -> bool:
+def nvidia_available() -> bool:
     try:
         subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, check=True)
@@ -47,68 +144,58 @@ def nvidia_smi_available() -> bool:
 
 
 def query_gpus() -> list[dict]:
-    """Return a list of dicts, one per GPU."""
-    query = ",".join(GPU_QUERY_FIELDS)
     try:
         result = subprocess.run(
-            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+            ["nvidia-smi",
+             f"--query-gpu={','.join(GPU_FIELDS)}",
+             "--format=csv,noheader,nounits"],
             capture_output=True, text=True, check=True,
         )
         gpus = []
         for line in result.stdout.strip().splitlines():
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) == len(GPU_QUERY_FIELDS):
-                gpus.append(dict(zip(GPU_QUERY_FIELDS, parts)))
+            if len(parts) == len(GPU_FIELDS):
+                gpus.append(dict(zip(GPU_FIELDS, parts)))
         return gpus
     except Exception:
         return []
 
 
-# ── SAMPLING ──────────────────────────────────────────────────────────────────
-def sample(has_gpu: bool, prev_disk) -> tuple[dict, object]:
-    ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    cpu  = psutil.cpu_percent(interval=None)
-    per_core = psutil.cpu_percent(interval=None, percpu=True)
-    ram  = psutil.virtual_memory()
-    disk_now = psutil.disk_io_counters()
-
-    # Disk I/O rates (bytes/s since last sample — 0 on first call)
-    disk_read_rate  = 0.0
-    disk_write_rate = 0.0
-    if prev_disk is not None:
-        dt = DEFAULT_INTERVAL  # approximate; caller tracks real elapsed
-        disk_read_rate  = (disk_now.read_bytes  - prev_disk.read_bytes)  / dt / 1024 / 1024
-        disk_write_rate = (disk_now.write_bytes - prev_disk.write_bytes) / dt / 1024 / 1024
+# ── SAMPLE ────────────────────────────────────────────────────────────────────
+def sample(has_gpu: bool) -> dict:
+    ts                   = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    cpu_overall, per_core = cpu_percent()
+    ram_used, ram_total, ram_pct = ram_stats()
+    disk_read, disk_write = disk_io_rates()
 
     row = {
-        "timestamp":        ts,
-        "cpu_pct":          cpu,
-        "cpu_cores":        ",".join(str(c) for c in per_core),
-        "ram_used_gb":      round(ram.used / 1024**3, 2),
-        "ram_total_gb":     round(ram.total / 1024**3, 2),
-        "ram_pct":          ram.percent,
-        "disk_read_mbps":   round(disk_read_rate, 2),
-        "disk_write_mbps":  round(disk_write_rate, 2),
+        "timestamp":       ts,
+        "cpu_pct":         cpu_overall,
+        "cpu_cores":       ",".join(str(c) for c in per_core),
+        "ram_used_gb":     ram_used,
+        "ram_total_gb":    ram_total,
+        "ram_pct":         ram_pct,
+        "disk_read_mbps":  disk_read,
+        "disk_write_mbps": disk_write,
     }
 
-    # GPU columns (up to 4 GPUs; pad with empty if fewer)
     if has_gpu:
         gpus = query_gpus()
         for i in range(4):
             pfx = f"gpu{i}_"
             if i < len(gpus):
                 g = gpus[i]
-                row[pfx + "util_pct"]   = g.get("utilization.gpu",    "")
-                row[pfx + "mem_pct"]    = g.get("utilization.memory",  "")
-                row[pfx + "mem_used_mb"]= g.get("memory.used",         "")
-                row[pfx + "mem_total_mb"]= g.get("memory.total",       "")
-                row[pfx + "temp_c"]     = g.get("temperature.gpu",     "")
-                row[pfx + "power_w"]    = g.get("power.draw",          "")
+                row[pfx + "util_pct"]    = g.get("utilization.gpu",    "")
+                row[pfx + "mem_pct"]     = g.get("utilization.memory",  "")
+                row[pfx + "mem_used_mb"] = g.get("memory.used",         "")
+                row[pfx + "mem_total_mb"]= g.get("memory.total",        "")
+                row[pfx + "temp_c"]      = g.get("temperature.gpu",     "")
+                row[pfx + "power_w"]     = g.get("power.draw",          "")
             else:
                 for sfx in ["util_pct","mem_pct","mem_used_mb","mem_total_mb","temp_c","power_w"]:
                     row[pfx + sfx] = ""
 
-    return row, disk_now
+    return row
 
 
 # ── SUMMARY ───────────────────────────────────────────────────────────────────
@@ -116,114 +203,117 @@ def print_summary(rows: list[dict], has_gpu: bool, elapsed: float):
     if not rows:
         return
 
-    def col_floats(key):
-        return [float(r[key]) for r in rows if r.get(key) not in ("", None)]
+    def floats(key):
+        return [float(r[key]) for r in rows if r.get(key) not in ("", None, "")]
 
-    def stats(vals):
+    def stats(vals, unit=""):
         if not vals:
             return "n/a"
-        return f"avg={sum(vals)/len(vals):.1f}  peak={max(vals):.1f}"
+        return f"avg {sum(vals)/len(vals):.1f}{unit}  peak {max(vals):.1f}{unit}"
 
     print("\n" + "=" * 60)
     print("  VM Monitor — Run Summary")
     print("=" * 60)
-    print(f"  Duration  : {elapsed:.1f}s   Samples: {len(rows)}")
-    print(f"  CPU %     : {stats(col_floats('cpu_pct'))}")
-    print(f"  RAM used  : {stats(col_floats('ram_used_gb'))} GB")
-    print(f"  RAM %     : {stats(col_floats('ram_pct'))}")
+    print(f"  Duration   : {elapsed:.1f}s    Samples : {len(rows)}")
+    print(f"  CPU        : {stats(floats('cpu_pct'), '%')}")
+    print(f"  RAM used   : {stats(floats('ram_used_gb'), ' GB')}")
+    print(f"  RAM %      : {stats(floats('ram_pct'), '%')}")
+    print(f"  Disk read  : {stats(floats('disk_read_mbps'), ' MB/s')}")
+    print(f"  Disk write : {stats(floats('disk_write_mbps'), ' MB/s')}")
 
     if has_gpu:
         for i in range(4):
-            util = col_floats(f"gpu{i}_util_pct")
-            if util:
-                mem  = col_floats(f"gpu{i}_mem_used_mb")
-                temp = col_floats(f"gpu{i}_temp_c")
-                pwr  = col_floats(f"gpu{i}_power_w")
-                print(f"  GPU {i} util : {stats(util)} %")
-                print(f"  GPU {i} VRAM : {stats(mem)} MB")
-                print(f"  GPU {i} temp : {stats(temp)} °C")
-                print(f"  GPU {i} power: {stats(pwr)} W")
+            util = floats(f"gpu{i}_util_pct")
+            if not util:
+                continue
+            mem  = floats(f"gpu{i}_mem_used_mb")
+            temp = floats(f"gpu{i}_temp_c")
+            pwr  = floats(f"gpu{i}_power_w")
+            print(f"  GPU {i} util  : {stats(util, '%')}")
+            print(f"  GPU {i} VRAM  : {stats([m/1024 for m in mem], ' GB')}")
+            print(f"  GPU {i} temp  : {stats(temp, '°C')}")
+            print(f"  GPU {i} power : {stats(pwr, ' W')}")
     print("=" * 60)
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="VM resource monitor")
-    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
-                        help="Sampling interval in seconds (default: 2)")
-    parser.add_argument("--output",   default=DEFAULT_OUTPUT,
-                        help=f"Output CSV path (default: {DEFAULT_OUTPUT})")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--interval", type=float, default=2.0)
+    parser.add_argument("--output",   default="vm_metrics.csv")
     args = parser.parse_args()
 
-    has_gpu = nvidia_smi_available()
+    if not sys.platform.startswith("linux"):
+        sys.exit("This script reads /proc — Linux only.")
 
-    print("=" * 60)
-    print("  VM Resource Monitor")
-    print("=" * 60)
-    print(f"  Interval : {args.interval}s")
-    print(f"  Output   : {args.output}")
-    print(f"  GPU      : {'detected via nvidia-smi' if has_gpu else 'not detected'}")
-    print(f"  CPU cores: {psutil.cpu_count()}")
-    ram = psutil.virtual_memory()
-    print(f"  RAM total: {ram.total / 1024**3:.1f} GB")
-    print("=" * 60)
-    print("Logging started. Press Ctrl+C to stop.\n")
+    has_gpu = nvidia_available()
 
-    rows      = []
-    prev_disk = None
-    start     = time.time()
-    fieldnames = None
+    # Print startup info
+    _, ram_total, _ = ram_stats()
+    cpu_count = len(read_cpu_stat()) - 1
+    print("=" * 60)
+    print("  VM Resource Monitor  (no external dependencies)")
+    print("=" * 60)
+    print(f"  Interval  : {args.interval}s")
+    print(f"  Output    : {args.output}")
+    print(f"  CPU cores : {cpu_count}")
+    print(f"  RAM total : {ram_total} GB")
+    print(f"  GPU       : {'detected (nvidia-smi)' if has_gpu else 'not detected'}")
+    print("=" * 60)
+    print("Logging started — press Ctrl+C to stop.\n")
 
-    # Warm up cpu_percent (first call always returns 0)
-    psutil.cpu_percent(interval=None)
-    psutil.cpu_percent(interval=None, percpu=True)
+    # Warm-up read (first cpu_percent call always returns 0)
+    cpu_percent()
+    time.sleep(0.2)
+
+    rows    = []
+    start   = time.time()
+    writer  = None
+    stopped = False
 
     def handle_stop(sig, frame):
-        pass  # just break the loop cleanly
+        nonlocal stopped
+        stopped = True
 
     signal.signal(signal.SIGTERM, handle_stop)
 
     try:
         with open(args.output, "w", newline="") as csvfile:
-            writer = None
-
-            while True:
+            while not stopped:
                 loop_start = time.time()
-                row, prev_disk = sample(has_gpu, prev_disk)
+                row = sample(has_gpu)
                 rows.append(row)
 
-                # Write header on first row
                 if writer is None:
-                    fieldnames = list(row.keys())
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer = csv.DictWriter(csvfile, fieldnames=list(row.keys()))
                     writer.writeheader()
 
                 writer.writerow(row)
                 csvfile.flush()
 
-                # Print a live one-liner
                 gpu_str = ""
-                if has_gpu and f"gpu0_util_pct" in row and row["gpu0_util_pct"] != "":
-                    gpu_str = f"  GPU0 {row['gpu0_util_pct']}% VRAM {int(float(row['gpu0_mem_used_mb'])/1024*10)/10:.1f}GB"
+                if has_gpu and row.get("gpu0_util_pct") not in ("", None):
+                    vram_gb = float(row["gpu0_mem_used_mb"]) / 1024
+                    gpu_str = f"  GPU {row['gpu0_util_pct']}%  VRAM {vram_gb:.1f}GB"
+
                 print(
                     f"[{row['timestamp']}]  "
                     f"CPU {row['cpu_pct']:5.1f}%  "
-                    f"RAM {row['ram_used_gb']:.1f}/{row['ram_total_gb']:.0f}GB ({row['ram_pct']:.0f}%)"
+                    f"RAM {row['ram_used_gb']:.1f}/{row['ram_total_gb']:.0f}GB "
+                    f"({row['ram_pct']:.0f}%)"
                     f"{gpu_str}",
                     flush=True,
                 )
 
-                # Sleep for the remainder of the interval
-                elapsed_loop = time.time() - loop_start
-                sleep_time = max(0, args.interval - elapsed_loop)
-                time.sleep(sleep_time)
+                sleep_for = max(0.0, args.interval - (time.time() - loop_start))
+                time.sleep(sleep_for)
 
     except KeyboardInterrupt:
         pass
 
-    total_elapsed = time.time() - start
-    print(f"\nStopped. {len(rows)} samples written to {args.output}")
-    print_summary(rows, has_gpu, total_elapsed)
+    elapsed = time.time() - start
+    print(f"\nStopped. {len(rows)} samples → {args.output}")
+    print_summary(rows, has_gpu, elapsed)
 
 
 if __name__ == "__main__":
