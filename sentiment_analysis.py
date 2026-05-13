@@ -5,18 +5,21 @@ Scores 50 text samples across multiple available SLMs.
 
 import json
 import time
+import requests
 from openai import OpenAI
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-BASE_URL = "http://<your-vm-ip>:3000/api/v1"   # replace with your VM address
-API_KEY  = "sk-your-key-here"                   # replace with your Open WebUI key
+HOST    = "http://10.120.100.16"                 # base host (no trailing slash)
+API_KEY = "sk-your-key-here"                     # replace with your Open WebUI key
 
-# Models to test — update to match what your Ollama instance has
+# Open WebUI OpenAI-compatible endpoint
+BASE_URL = f"{HOST}/openai/v1"
+
+# Models to test — script will auto-detect available ones, but list fallback here
 MODELS = [
     "llama3.2:latest",
     "mistral:latest",
     "gemma2:latest",
-    # add/remove based on what's available at your endpoint
 ]
 
 # ── 50 SAMPLE TEXTS ──────────────────────────────────────────────────────────
@@ -85,9 +88,24 @@ client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
 
 def list_available_models() -> list[str]:
-    """Fetch model list from the endpoint."""
-    models = client.models.list()
-    return [m.id for m in models.data]
+    """Fetch model list via raw requests to avoid openai SDK parsing issues."""
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    # Try OpenAI-compatible endpoint first, then Open WebUI native endpoint
+    for url in [f"{BASE_URL}/models", f"{HOST}/api/models"]:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            # Handle both {"data": [...]} and {"models": [...]} shapes
+            items = data.get("data") or data.get("models") or []
+            ids = [m.get("id") or m.get("name") or m.get("model") for m in items if isinstance(m, dict)]
+            ids = [i for i in ids if i]  # drop None
+            if ids:
+                print(f"  (fetched from {url})")
+                return ids
+        except Exception as e:
+            print(f"  Model list attempt failed ({url}): {e}")
+    return []
 
 
 def analyze_sentiment(text: str, model: str) -> dict:
@@ -152,21 +170,32 @@ def print_summary(model: str, results: list[dict]):
 
 def main():
     print("Connecting to Open WebUI / Ollama endpoint...")
-    print(f"Endpoint: {BASE_URL}\n")
+    print(f"Host    : {HOST}")
+    print(f"Base URL: {BASE_URL}")
+    print(f"API key : {API_KEY[:8]}...\n")
+
+    # Quick connectivity check
+    try:
+        r = requests.get(HOST, timeout=5)
+        print(f"Host reachable — HTTP {r.status_code}\n")
+    except Exception as e:
+        print(f"Cannot reach host {HOST}: {e}")
+        print("Check your HOST setting and network access.")
+        return
 
     # Show available models
-    try:
-        available = list_available_models()
+    print("Fetching available models...")
+    available = list_available_models()
+    if available:
         print("Available models:", available)
-    except Exception as e:
-        print(f"Could not fetch model list: {e}")
-        available = []
+    else:
+        print("Could not auto-detect models — using fallback MODELS list.")
 
-    # Filter MODELS list to only those actually available
-    models_to_run = [m for m in MODELS if m in available] or MODELS
+    # Use detected models if any match; otherwise run the full fallback list
+    models_to_run = [m for m in MODELS if m in available] if available else MODELS
     if not models_to_run:
-        print("No matching models found. Check MODELS list or run list_available_models().")
-        return
+        models_to_run = available[:3] if available else MODELS  # use first 3 detected
+    print(f"\nModels to run: {models_to_run}\n")
 
     all_results = {}
     for model in models_to_run:
