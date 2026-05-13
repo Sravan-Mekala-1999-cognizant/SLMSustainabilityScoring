@@ -8,8 +8,8 @@ import time
 import ollama
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-# No API key needed — Open WebUI proxies Ollama without auth on this endpoint
 OLLAMA_HOST = "http://10.120.100.16/ollama"
+API_KEY     = "sk-your-key-here"   # Open WebUI: Settings → Account → API Keys
 
 # Models to run sentiment analysis with (picked for speed vs quality balance).
 # All confirmed available from /ollama/api/tags. Edit freely.
@@ -85,7 +85,10 @@ SYSTEM_PROMPT = (
 )
 
 # ── CLIENT ────────────────────────────────────────────────────────────────────
-client = ollama.Client(host=OLLAMA_HOST)
+client = ollama.Client(
+    host=OLLAMA_HOST,
+    headers={"Authorization": f"Bearer {API_KEY}"},
+)
 
 
 def list_available_models() -> list[str]:
