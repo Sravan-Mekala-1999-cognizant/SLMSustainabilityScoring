@@ -240,7 +240,8 @@ def print_summary(rows: list[dict], has_gpu: bool, elapsed: float):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--interval", type=float, default=2.0)
-    parser.add_argument("--output",   default="vm_metrics.csv")
+    parser.add_argument("--output",   default=None,
+                        help="Save to CSV file (omit to print to terminal only)")
     args = parser.parse_args()
 
     if not sys.platform.startswith("linux"):
@@ -255,7 +256,7 @@ def main():
     print("  VM Resource Monitor  (no external dependencies)")
     print("=" * 60)
     print(f"  Interval  : {args.interval}s")
-    print(f"  Output    : {args.output}")
+    print(f"  Output    : {args.output if args.output else 'terminal only (use --output file.csv to save)'}")
     print(f"  CPU cores : {cpu_count}")
     print(f"  RAM total : {ram_total} GB")
     print(f"  GPU       : {'detected (nvidia-smi)' if has_gpu else 'not detected'}")
@@ -277,42 +278,49 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_stop)
 
-    try:
-        with open(args.output, "w", newline="") as csvfile:
-            while not stopped:
-                loop_start = time.time()
-                row = sample(has_gpu)
-                rows.append(row)
+    def run_loop(csvfile=None):
+        nonlocal writer
+        while not stopped:
+            loop_start = time.time()
+            row = sample(has_gpu)
+            rows.append(row)
 
+            if csvfile is not None:
                 if writer is None:
                     writer = csv.DictWriter(csvfile, fieldnames=list(row.keys()))
                     writer.writeheader()
-
                 writer.writerow(row)
                 csvfile.flush()
 
-                gpu_str = ""
-                if has_gpu and row.get("gpu0_util_pct") not in ("", None):
-                    vram_gb = float(row["gpu0_mem_used_mb"]) / 1024
-                    gpu_str = f"  GPU {row['gpu0_util_pct']}%  VRAM {vram_gb:.1f}GB"
+            gpu_str = ""
+            if has_gpu and row.get("gpu0_util_pct") not in ("", None):
+                vram_gb = float(row["gpu0_mem_used_mb"]) / 1024
+                gpu_str = f"  GPU {row['gpu0_util_pct']}%  VRAM {vram_gb:.1f}GB"
 
-                print(
-                    f"[{row['timestamp']}]  "
-                    f"CPU {row['cpu_pct']:5.1f}%  "
-                    f"RAM {row['ram_used_gb']:.1f}/{row['ram_total_gb']:.0f}GB "
-                    f"({row['ram_pct']:.0f}%)"
-                    f"{gpu_str}",
-                    flush=True,
-                )
+            print(
+                f"[{row['timestamp']}]  "
+                f"CPU {row['cpu_pct']:5.1f}%  "
+                f"RAM {row['ram_used_gb']:.1f}/{row['ram_total_gb']:.0f}GB "
+                f"({row['ram_pct']:.0f}%)"
+                f"{gpu_str}",
+                flush=True,
+            )
 
-                sleep_for = max(0.0, args.interval - (time.time() - loop_start))
-                time.sleep(sleep_for)
+            sleep_for = max(0.0, args.interval - (time.time() - loop_start))
+            time.sleep(sleep_for)
 
+    try:
+        if args.output:
+            with open(args.output, "w", newline="") as csvfile:
+                run_loop(csvfile)
+        else:
+            run_loop()
     except KeyboardInterrupt:
         pass
 
     elapsed = time.time() - start
-    print(f"\nStopped. {len(rows)} samples → {args.output}")
+    saved_msg = f"  Saved to  : {args.output}" if args.output else "  (no file saved)"
+    print(f"\nStopped. {len(rows)} samples collected.\n{saved_msg}")
     print_summary(rows, has_gpu, elapsed)
 
 
