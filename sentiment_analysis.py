@@ -1,25 +1,24 @@
 """
-Sentiment analysis using Ollama models via Open WebUI API.
-Scores 50 text samples across multiple available SLMs.
+Sentiment analysis using Ollama SLMs via Open WebUI proxy.
+Scores 50 text samples across multiple models and saves results to JSON.
 """
 
 import json
 import time
-import requests
-from openai import OpenAI
+import ollama
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-HOST    = "http://10.120.100.16"                 # base host (no trailing slash)
-API_KEY = "sk-your-key-here"                     # replace with your Open WebUI key
+# No API key needed — Open WebUI proxies Ollama without auth on this endpoint
+OLLAMA_HOST = "http://10.120.100.16/ollama"
 
-# LiteLLM proxy endpoint (confirmed from browser network calls)
-BASE_URL = f"{HOST}/litellm/v1"
-
-# Models to test — script will auto-detect available ones, but list fallback here
+# Models to run sentiment analysis with (picked for speed vs quality balance).
+# All confirmed available from /ollama/api/tags. Edit freely.
 MODELS = [
-    "llama3.2:latest",
-    "mistral:latest",
-    "gemma2:latest",
+    "tinyllama:latest",     #  1B  — fastest baseline
+    "llama3.2:latest",      #  3B  — good small general model
+    "gemma2:2b",            #  2.6B — fast, strong reasoning
+    "mistral:7b",           #  7B  — solid mid-range
+    "gemma2:9b",            #  9B  — best quality in this selection
 ]
 
 # ── 50 SAMPLE TEXTS ──────────────────────────────────────────────────────────
@@ -76,66 +75,57 @@ TEXTS = [
     "Packaging was damaged and product arrived broken.",
 ]
 
-SYSTEM_PROMPT = """You are a sentiment analysis engine. Analyze the sentiment of the given text and respond ONLY with a valid JSON object in this exact format:
-{"sentiment": "positive" | "negative" | "neutral", "score": <float 0.0-1.0>, "confidence": "high" | "medium" | "low"}
-
-- score: 1.0 = most positive, 0.0 = most negative, 0.5 = neutral
-- confidence: how certain you are of the label
-No explanation, no extra text — only the JSON object."""
+SYSTEM_PROMPT = (
+    "You are a sentiment analysis engine. "
+    "Analyze the sentiment of the user's text and reply ONLY with a valid JSON object — "
+    "no explanation, no markdown, no extra text.\n"
+    "Format: {\"sentiment\": \"positive\"|\"negative\"|\"neutral\", "
+    "\"score\": <float 0.0–1.0>, \"confidence\": \"high\"|\"medium\"|\"low\"}\n"
+    "score: 1.0 = most positive, 0.0 = most negative, 0.5 = neutral."
+)
 
 # ── CLIENT ────────────────────────────────────────────────────────────────────
-client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+client = ollama.Client(host=OLLAMA_HOST)
 
 
 def list_available_models() -> list[str]:
-    """Fetch model list via raw requests to avoid openai SDK parsing issues."""
-    headers = {"Authorization": f"Bearer {API_KEY}"}
-    # LiteLLM proxy models endpoint (confirmed from browser network calls)
-    for url in [f"{BASE_URL}/models", f"{HOST}/openai/v1/models"]:
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            # Handle both {"data": [...]} and {"models": [...]} shapes
-            items = data.get("data") or data.get("models") or []
-            ids = [m.get("id") or m.get("name") or m.get("model") for m in items if isinstance(m, dict)]
-            ids = [i for i in ids if i]  # drop None
-            if ids:
-                print(f"  (fetched from {url})")
-                return ids
-        except Exception as e:
-            print(f"  Model list attempt failed ({url}): {e}")
-    return []
+    """Return model names from Ollama via SDK."""
+    response = client.list()
+    return [m.model for m in response.models]
 
 
 def analyze_sentiment(text: str, model: str) -> dict:
-    """Run sentiment analysis on a single text using the given model."""
+    """Score a single text using the given model."""
     try:
-        response = client.chat.completions.create(
+        response = client.chat(
             model=model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": text},
             ],
-            temperature=0.1,
-            max_tokens=60,
+            options={"temperature": 0.1, "num_predict": 60},
         )
-        raw = response.choices[0].message.content.strip()
-        return json.loads(raw)
+        raw = response.message.content.strip()
+        # Strip markdown code fences if model adds them
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
     except json.JSONDecodeError:
-        return {"sentiment": "error", "score": -1, "confidence": "none", "raw": raw}
+        return {"sentiment": "error", "score": -1.0, "confidence": "none", "raw": raw}
     except Exception as e:
-        return {"sentiment": "error", "score": -1, "confidence": "none", "error": str(e)}
+        return {"sentiment": "error", "score": -1.0, "confidence": "none", "error": str(e)}
 
 
 def run_analysis(model: str) -> list[dict]:
-    """Score all 50 texts with the given model."""
+    """Score all 50 texts with the given model, print a live table."""
     results = []
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"  Model: {model}")
-    print(f"{'='*60}")
-    print(f"{'#':<4} {'Sentiment':<10} {'Score':<7} {'Conf':<8} Text")
-    print("-" * 80)
+    print(f"{'='*70}")
+    print(f"{'#':<4} {'Sentiment':<10} {'Score':<7} {'Conf':<8} Text preview")
+    print("-" * 70)
 
     for i, text in enumerate(TEXTS, 1):
         result = analyze_sentiment(text, model)
@@ -145,69 +135,70 @@ def run_analysis(model: str) -> list[dict]:
         sentiment  = result.get("sentiment", "?")
         score      = result.get("score", -1)
         confidence = result.get("confidence", "?")
-        preview    = text[:50] + "..." if len(text) > 50 else text
-        print(f"{i:<4} {sentiment:<10} {score:<7.2f} {confidence:<8} {preview}")
-        time.sleep(0.1)  # small delay to avoid hammering the server
+        preview    = text[:48] + "…" if len(text) > 48 else text
+        score_str  = f"{score:.2f}" if score >= 0 else "error"
+        print(f"{i:<4} {sentiment:<10} {score_str:<7} {confidence:<8} {preview}")
 
     return results
 
 
 def print_summary(model: str, results: list[dict]):
-    counts = {"positive": 0, "negative": 0, "neutral": 0, "error": 0}
+    counts = {}
     for r in results:
-        counts[r.get("sentiment", "error")] = counts.get(r.get("sentiment", "error"), 0) + 1
+        s = r.get("sentiment", "error")
+        counts[s] = counts.get(s, 0) + 1
 
-    valid = [r for r in results if r.get("score", -1) >= 0]
-    avg_score = sum(r["score"] for r in valid) / len(valid) if valid else 0
+    valid  = [r for r in results if r.get("score", -1) >= 0]
+    avg    = sum(r["score"] for r in valid) / len(valid) if valid else 0
 
-    print(f"\nSummary for {model}:")
-    print(f"  Positive : {counts['positive']}")
-    print(f"  Negative : {counts['negative']}")
-    print(f"  Neutral  : {counts['neutral']}")
-    print(f"  Errors   : {counts['error']}")
-    print(f"  Avg score: {avg_score:.3f}")
+    print(f"\n  Summary — {model}")
+    for label, count in sorted(counts.items()):
+        bar = "█" * count
+        print(f"    {label:<10} {count:>3}  {bar}")
+    print(f"    avg score  {avg:.3f}  ({len(valid)}/{len(results)} parsed)")
 
 
 def main():
-    print("Connecting to Open WebUI / Ollama endpoint...")
-    print(f"Host    : {HOST}")
-    print(f"Base URL: {BASE_URL}")
-    print(f"API key : {API_KEY[:8]}...\n")
+    print("=" * 70)
+    print(f"  Ollama Sentiment Scorer")
+    print(f"  Host : {OLLAMA_HOST}")
+    print("=" * 70)
 
-    # Quick connectivity check
+    # Verify connection and list models
     try:
-        r = requests.get(HOST, timeout=5)
-        print(f"Host reachable — HTTP {r.status_code}\n")
+        available = list_available_models()
+        print(f"\nModels on this Ollama instance ({len(available)} total):")
+        for m in available:
+            print(f"  • {m}")
     except Exception as e:
-        print(f"Cannot reach host {HOST}: {e}")
-        print("Check your HOST setting and network access.")
+        print(f"\nCould not connect to {OLLAMA_HOST}: {e}")
+        print("Check that the VM is reachable and OLLAMA_HOST is correct.")
         return
 
-    # Show available models
-    print("Fetching available models...")
-    available = list_available_models()
-    if available:
-        print("Available models:", available)
-    else:
-        print("Could not auto-detect models — using fallback MODELS list.")
-
-    # Use detected models if any match; otherwise run the full fallback list
-    models_to_run = [m for m in MODELS if m in available] if available else MODELS
+    # Confirm which models we'll run
+    models_to_run = [m for m in MODELS if m in available]
+    missing = [m for m in MODELS if m not in available]
+    if missing:
+        print(f"\nNot found (skipping): {missing}")
     if not models_to_run:
-        models_to_run = available[:3] if available else MODELS  # use first 3 detected
-    print(f"\nModels to run: {models_to_run}\n")
+        print("None of the MODELS list are available. Update MODELS in the script.")
+        return
+    print(f"\nRunning analysis with: {models_to_run}")
 
     all_results = {}
     for model in models_to_run:
+        t0 = time.time()
         results = run_analysis(model)
+        elapsed = time.time() - t0
         all_results[model] = results
         print_summary(model, results)
+        print(f"  time : {elapsed:.1f}s  ({elapsed/len(TEXTS):.2f}s per text)")
 
-    # Save full results to JSON
+    # Save to JSON
     output_file = "sentiment_results.json"
-    with open(output_file, "w") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"\nFull results saved to {output_file}")
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, indent=2, ensure_ascii=False)
+    print(f"\nResults saved → {output_file}")
 
 
 if __name__ == "__main__":
