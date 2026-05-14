@@ -5,20 +5,17 @@ Scores 50 text samples across multiple models and saves results to JSON.
 
 import json
 import time
+from datetime import datetime
 import ollama
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 OLLAMA_HOST = "http://10.120.100.16/ollama"
 API_KEY     = "sk-your-key-here"   # Open WebUI: Settings → Account → API Keys
 
-# Models to run sentiment analysis with (picked for speed vs quality balance).
-# All confirmed available from /ollama/api/tags. Edit freely.
+# SLM vs LLM comparison pair — change these to try different combos
 MODELS = [
-    "tinyllama:latest",     #  1B  — fastest baseline
-    "llama3.2:latest",      #  3B  — good small general model
-    "gemma2:2b",            #  2.6B — fast, strong reasoning
-    "mistral:7b",           #  7B  — solid mid-range
-    "gemma2:9b",            #  9B  — best quality in this selection
+    "llama3.2:latest",   # SLM — 3.2B parameters
+    "llama3.3:70b",      # LLM — 70.6B parameters
 ]
 
 # ── 50 SAMPLE TEXTS ──────────────────────────────────────────────────────────
@@ -98,7 +95,8 @@ def list_available_models() -> list[str]:
 
 
 def analyze_sentiment(text: str, model: str) -> dict:
-    """Score a single text using the given model."""
+    """Score a single text using the given model. Captures Ollama inference metadata."""
+    wall_start = datetime.utcnow().isoformat() + "Z"
     try:
         response = client.chat(
             model=model,
@@ -108,17 +106,40 @@ def analyze_sentiment(text: str, model: str) -> dict:
             ],
             options={"temperature": 0.1, "num_predict": 60},
         )
+        wall_end = datetime.utcnow().isoformat() + "Z"
         raw = response.message.content.strip()
-        # Strip markdown code fences if model adds them
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        return json.loads(raw.strip())
+
+        result = json.loads(raw.strip())
+
+        eval_count     = response.eval_count     or 0
+        eval_dur_ns    = response.eval_duration  or 0
+        prompt_count   = response.prompt_eval_count    or 0
+        prompt_dur_ns  = response.prompt_eval_duration or 0
+        total_dur_ns   = response.total_duration or 0
+
+        result["meta"] = {
+            "wall_start":          wall_start,
+            "wall_end":            wall_end,
+            "total_duration_ms":   round(total_dur_ns   / 1e6, 2),
+            "prompt_tokens":       prompt_count,
+            "prompt_duration_ms":  round(prompt_dur_ns  / 1e6, 2),
+            "completion_tokens":   eval_count,
+            "completion_duration_ms": round(eval_dur_ns / 1e6, 2),
+            "tokens_per_sec":      round(eval_count / (eval_dur_ns / 1e9), 2) if eval_dur_ns > 0 else 0,
+        }
+        return result
+
     except json.JSONDecodeError:
-        return {"sentiment": "error", "score": -1.0, "confidence": "none", "raw": raw}
+        return {"sentiment": "error", "score": -1.0, "confidence": "none",
+                "meta": {"wall_start": wall_start, "wall_end": datetime.utcnow().isoformat() + "Z"}}
     except Exception as e:
-        return {"sentiment": "error", "score": -1.0, "confidence": "none", "error": str(e)}
+        return {"sentiment": "error", "score": -1.0, "confidence": "none",
+                "meta": {"wall_start": wall_start, "wall_end": datetime.utcnow().isoformat() + "Z"},
+                "error": str(e)}
 
 
 def run_analysis(model: str) -> list[dict]:
@@ -190,12 +211,29 @@ def main():
 
     all_results = {}
     for model in models_to_run:
-        t0 = time.time()
-        results = run_analysis(model)
-        elapsed = time.time() - t0
-        all_results[model] = results
+        t0         = time.time()
+        wall_start = datetime.utcnow().isoformat() + "Z"
+        results    = run_analysis(model)
+        wall_end   = datetime.utcnow().isoformat() + "Z"
+        elapsed    = time.time() - t0
+
+        valid = [r for r in results if r.get("meta", {}).get("tokens_per_sec", 0) > 0]
+        avg_tps = sum(r["meta"]["tokens_per_sec"] for r in valid) / len(valid) if valid else 0
+        total_tokens = sum(
+            r.get("meta", {}).get("prompt_tokens", 0) + r.get("meta", {}).get("completion_tokens", 0)
+            for r in results
+        )
+
+        all_results[model] = {
+            "wall_start":    wall_start,
+            "wall_end":      wall_end,
+            "elapsed_sec":   round(elapsed, 2),
+            "total_tokens":  total_tokens,
+            "avg_tokens_per_sec": round(avg_tps, 2),
+            "results":       results,
+        }
         print_summary(model, results)
-        print(f"  time : {elapsed:.1f}s  ({elapsed/len(TEXTS):.2f}s per text)")
+        print(f"  time : {elapsed:.1f}s  avg {avg_tps:.1f} tok/s  total tokens: {total_tokens}")
 
     # Save to JSON
     output_file = "sentiment_results.json"
